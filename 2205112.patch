@@ -1,0 +1,438 @@
+diff --git a/Makefile b/Makefile
+index 62fd0f8..fb128a3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -139,6 +139,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_trace\
++	$U/_history\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d1b6bb9..e222121 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -140,6 +140,8 @@ void            argaddr(int, uint64 *);
+ int             fetchstr(uint64, char*, int);
+ int             fetchaddr(uint64, uint64*);
+ void            syscall();
++void            syscallstatsinit(void);
++uint64          history(int num, uint64 addr);
+ 
+ // trap.c
+ extern uint     ticks;
+diff --git a/kernel/main.c b/kernel/main.c
+index f0d3171..cba2caa 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -20,6 +20,7 @@ main()
+     kvminit();       // create kernel page table
+     kvminithart();   // turn on paging
+     procinit();      // process table
++    syscallstatsinit();
+     trapinit();      // trap vectors
+     trapinithart();  // install kernel trap vector
+     plicinit();      // set up interrupt controller
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..5250d7e 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -124,6 +124,7 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->trace_num = -1;
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..16956bb 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int trace_num;
+ };
+diff --git a/kernel/stat.h b/kernel/stat.h
+index 19543af..ae69bdd 100644
+--- a/kernel/stat.h
++++ b/kernel/stat.h
+@@ -9,3 +9,9 @@ struct stat {
+   short nlink; // Number of links to file
+   uint64 size; // Size of file in bytes
+ };
++
++struct syscall_stat {
++  char syscall_name[16];
++  int count;
++  int accum_time;
++};
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..d3e075e 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -6,6 +6,7 @@
+ #include "proc.h"
+ #include "syscall.h"
+ #include "defs.h"
++#include "stat.h"
+ 
+ // Fetch the uint64 at addr from the current process.
+ int
+@@ -101,6 +102,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_trace(void);
++extern uint64 sys_history(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,19 +129,185 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_trace]   sys_trace,
++[SYS_history] sys_history,
+ };
+ 
++static char *syscallnames[] = {
++[SYS_fork]    "fork",
++[SYS_exit]    "exit",
++[SYS_wait]    "wait",
++[SYS_pipe]    "pipe",
++[SYS_read]    "read",
++[SYS_kill]    "kill",
++[SYS_exec]    "exec",
++[SYS_fstat]   "fstat",
++[SYS_chdir]   "chdir",
++[SYS_dup]     "dup",
++[SYS_getpid]  "getpid",
++[SYS_sbrk]    "sbrk",
++[SYS_sleep]   "sleep",
++[SYS_uptime]  "uptime",
++[SYS_open]    "open",
++[SYS_write]   "write",
++[SYS_mknod]   "mknod",
++[SYS_unlink]  "unlink",
++[SYS_link]    "link",
++[SYS_mkdir]   "mkdir",
++[SYS_close]   "close",
++[SYS_trace]   "trace",
++[SYS_history] "history",
++};
++
++#define MAXTRACEARGS 3
++enum argtype {ARG_NONE = 0, ARG_INT, ARG_PTR, ARG_STR};
++static char argtypes[NELEM(syscalls)][MAXTRACEARGS] ={
++  [SYS_fork]    {ARG_NONE},
++  [SYS_exit]    {ARG_INT},
++  [SYS_wait]    {ARG_PTR},
++  [SYS_pipe]    {ARG_PTR},
++  [SYS_read]    {ARG_INT, ARG_PTR, ARG_INT},
++  [SYS_kill]    {ARG_INT},
++  [SYS_exec]    {ARG_STR, ARG_PTR},
++  [SYS_fstat]   {ARG_INT, ARG_PTR},
++  [SYS_chdir]   {ARG_STR},
++  [SYS_dup]     {ARG_INT},
++  [SYS_getpid]  {ARG_NONE},
++  [SYS_sbrk]    {ARG_INT},
++  [SYS_sleep]   {ARG_INT},
++  [SYS_uptime]  {ARG_NONE},
++  [SYS_open]    {ARG_STR, ARG_INT},
++  [SYS_write]   {ARG_INT, ARG_PTR, ARG_INT},
++  [SYS_mknod]   {ARG_STR, ARG_INT, ARG_INT},
++  [SYS_unlink]  {ARG_STR},
++  [SYS_link]    {ARG_STR, ARG_STR},
++  [SYS_mkdir]   {ARG_STR},
++  [SYS_close]   {ARG_INT},
++  [SYS_trace]   {ARG_INT},
++  [SYS_history] {ARG_INT},
++};
++
++static void
++print_syscall_args(int num, uint64 *raw, char strbuf[][MAXPATH])
++{
++  int j;
++  int printed = 0;
++
++  for(j = 0; j < MAXTRACEARGS; j++) {
++    if(argtypes[num][j] == ARG_NONE)
++      break;
++
++    if(printed)
++      printf(", ");
++    else
++      printed = 1;
++
++    switch(argtypes[num][j]) {
++      case ARG_INT:
++        printf("%d", (int)raw[j]);
++        break;
++      case ARG_PTR:
++        printf("%p", (void*)raw[j]);
++        break;
++      case ARG_STR:
++        printf("\"%s\"", strbuf[j]);
++        break;
++      default:
++        break;
++    }
++  }
++}
++
++
++static struct spinlock stat_lock[NELEM(syscalls)];
++static struct syscall_stat syscall_stats[NELEM(syscalls)];
++
++void
++syscallstatsinit(void)
++{
++  int i;
++  for(i = 0; i < NELEM(syscalls); i++) {
++    initlock(&stat_lock[i], syscallnames[i]);
++    syscall_stats[i].count = 0;
++    syscall_stats[i].accum_time = 0;
++    if (syscallnames[i])
++    {
++      safestrcpy(syscall_stats[i].syscall_name, syscallnames[i], sizeof(syscall_stats[i].syscall_name));
++    } 
++  }
++}
++static void
++record_syscall_stat(int num, uint elapsed_time)
++{
++  if(num < 0 || num >= NELEM(syscalls))
++    return;
++
++  acquire(&stat_lock[num]);
++  syscall_stats[num].count++;
++  syscall_stats[num].accum_time += elapsed_time;
++  release(&stat_lock[num]);
++}
++uint64
++history(int num, uint64 addr)
++{
++  struct proc *p = myproc();
++  struct syscall_stat st;
++
++  if(num < 0 || num >= NELEM(syscalls) || syscallnames[num] == 0)
++    return -1;
++  acquire(&stat_lock[num]);
++  st = syscall_stats[num];
++  release(&stat_lock[num]);
++
++  if(copyout(p->pagetable, addr, (char*)&st, sizeof(st)) < 0)
++    return -1;
++  return 0;
++}
++
+ void
+ syscall(void)
+ {
+   int num;
+   struct proc *p = myproc();
++  uint64 raw[MAXTRACEARGS];
++  char strbuf[MAXTRACEARGS][MAXPATH];
++  int tracing;
++  int j;
++  uint ticks0, ticks1;
+ 
+   num = p->trapframe->a7;
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
++    tracing = (p->trace_num == num);
++    if(tracing) {
++      for(j = 0; j < MAXTRACEARGS; j++) {
++        if(argtypes[num][j] == ARG_NONE)
++          break;
++
++        raw[j] = argraw(j);
++        if(argtypes[num][j] == ARG_STR) {
++          fetchstr(raw[j], strbuf[j], sizeof(strbuf[j]));
++        }
++      }
++    }
++
++    acquire(&tickslock);
++    ticks0 = ticks;
++    release(&tickslock);
+     // Use num to lookup the system call function for num, call it,
+     // and store its return value in p->trapframe->a0
+     p->trapframe->a0 = syscalls[num]();
++
++    if(tracing){
++      printf("pid: %d, syscall: %s, args: (", p->pid, syscallnames[num]);
++      print_syscall_args(num, raw, strbuf);
++      printf("), return: %d\n", (int)p->trapframe->a0);
++    }
++
++    acquire(&tickslock);
++    ticks1 = ticks;
++    release(&tickslock);
++
++    record_syscall_stat(num, ticks1 - ticks0);
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+             p->pid, p->name, num);
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..4733bc4 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_trace  22
++#define SYS_history 23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..d339a97 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -91,3 +91,28 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_trace(void)
++{
++  int syscall_num;
++
++  argint(0, &syscall_num);
++  if(syscall_num < 0)
++    return -1;
++
++  myproc()->trace_num = syscall_num;
++  return 0;
++}
++
++uint64
++sys_history(void)
++{
++  int syscall_num;
++  uint64 addr;
++
++  argint(0, &syscall_num);
++  argaddr(1, &addr);
++
++  return history(syscall_num, addr);
++}
+\ No newline at end of file
+diff --git a/user/history.c b/user/history.c
+new file mode 100644
+index 0000000..8ccbd3e
+--- /dev/null
++++ b/user/history.c
+@@ -0,0 +1,40 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++#define MAX_SYSCALL 23
++
++void print_one(int num)
++{
++    struct syscall_stat st;
++
++    if (history(num, &st) < 0)
++        return;
++    printf("%d: syscall: %s, #: %d, time: %d\n",
++           num, st.syscall_name, st.count, st.accum_time);
++}
++
++int main(int argc, char *argv[])
++{
++    int num;
++
++    if (argc > 2)
++    {
++        fprintf(2, "Usage: %s [sys_call_num]\n", argv[0]);
++        exit(1);
++    }
++
++    if (argc == 2)
++    {
++        num = atoi(argv[1]);
++        print_one(num);
++    }
++    else
++    {
++        for (num = 1; num <= MAX_SYSCALL; num++)
++            print_one(num);
++    }
++
++    exit(0);
++}
+diff --git a/user/trace.c b/user/trace.c
+new file mode 100644
+index 0000000..45f5239
+--- /dev/null
++++ b/user/trace.c
+@@ -0,0 +1,29 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[])
++{
++    int i;
++    char *nargv[MAXARG];
++
++    if (argc < 3 || (argv[1][0] < '0' || argv[1][0] > '9'))
++    {
++        fprintf(2, "Usage: %s sys_call_num command\n", argv[0]);
++        exit(1);
++    }
++
++    if (trace(atoi(argv[1])) < 0)
++    {
++        fprintf(2, "%s: trace failed\n", argv[0]);
++        exit(1);
++    }
++
++    for (i = 2; i < argc && i < MAXARG; i++)
++    {
++        nargv[i - 2] = argv[i];
++    }
++    exec(nargv[0], nargv);
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 04013ca..b426d09 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,5 @@
+ struct stat;
++struct syscall_stat;
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int trace(int);
++int history(int, struct syscall_stat*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..83a6248 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("trace");
++entry("history");
+\ No newline at end of file
